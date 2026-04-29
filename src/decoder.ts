@@ -2,10 +2,16 @@ import type { BmpFileHeader, BmpImageData, BmpInfoHeader } from './types'
 import { BmpCompression } from './types'
 
 /**
- * Decode a BMP image buffer to RGBA pixel data
+ * Decode a BMP image buffer to RGBA pixel data.
+ * Accepts either a `Uint8Array` or an `ArrayBuffer`.
  */
 export function decode(buffer: Uint8Array | ArrayBuffer): BmpImageData {
   const data = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer
+
+  // File header (14) + smallest info header (BITMAPCOREHEADER, 12) = 26 bytes minimum
+  if (data.byteLength < 26)
+    throw new Error(`Invalid BMP file: buffer too small (got ${data.byteLength} bytes, need at least 26)`)
+
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
 
   // Read file header
@@ -15,6 +21,12 @@ export function decode(buffer: Uint8Array | ArrayBuffer): BmpImageData {
   }
 
   // Read info header
+  const declaredHeaderSize = view.getUint32(14, true)
+  if (data.byteLength < 14 + declaredHeaderSize) {
+    throw new Error(
+      `Invalid BMP file: buffer truncated (info header claims ${declaredHeaderSize} bytes, only ${data.byteLength - 14} available)`,
+    )
+  }
   const infoHeader = readInfoHeader(view, 14)
 
   // Handle different bit depths
@@ -53,7 +65,7 @@ export function decode(buffer: Uint8Array | ArrayBuffer): BmpImageData {
       decode24Bit(data, fileHeader, infoHeader, pixels, isBottomUp)
       break
     case 32:
-      decode32Bit(data, fileHeader, infoHeader, pixels, isBottomUp)
+      decode32Bit(data, view, fileHeader, infoHeader, pixels, isBottomUp)
       break
     default:
       throw new Error(`Unsupported bit depth: ${infoHeader.bitsPerPixel}`)
@@ -113,6 +125,30 @@ function readInfoHeader(view: DataView, offset: number): BmpInfoHeader {
   }
 }
 
+/**
+ * Read BITFIELDS masks for a 16/32-bit BMP.
+ *
+ * Why: For BITMAPINFOHEADER (40 bytes), masks live in the file *after* the
+ * header at file offset 14 + 40 = 54. For BITMAPV2/V3/V4/V5 headers (52, 56,
+ * 108, 124 bytes), the masks are *inside* the header at the same file offset
+ * (14 + 40 = 54). So the file offset is always 54 when masks are present.
+ */
+function readBitfieldMasks(
+  view: DataView,
+  headerSize: number,
+  compression: number,
+): { rMask: number, gMask: number, bMask: number, aMask: number } {
+  const maskOffset = 14 + 40
+  const rMask = view.getUint32(maskOffset, true)
+  const gMask = view.getUint32(maskOffset + 4, true)
+  const bMask = view.getUint32(maskOffset + 8, true)
+  // Alpha mask is part of V3+ headers (>= 56 bytes) or signaled by ALPHABITFIELDS.
+  const aMask = headerSize >= 56 || compression === BmpCompression.ALPHABITFIELDS
+    ? view.getUint32(maskOffset + 12, true)
+    : 0
+  return { rMask, gMask, bMask, aMask }
+}
+
 function readPalette(
   view: DataView,
   offset: number,
@@ -143,7 +179,8 @@ function decode1Bit(
   const { width } = infoHeader
   const height = Math.abs(infoHeader.height)
   const paletteOffset = 14 + infoHeader.headerSize
-  const palette = readPalette(view, paletteOffset, 2, infoHeader.headerSize === 12 ? 3 : 4)
+  const numColors = Math.min(infoHeader.colorsUsed || 2, 2)
+  const palette = readPalette(view, paletteOffset, numColors, infoHeader.headerSize === 12 ? 3 : 4)
 
   const rowSize = Math.ceil(width / 32) * 4 // Rows are padded to 4-byte boundaries
   const dataOffset = fileHeader.dataOffset
@@ -177,7 +214,7 @@ function decode4Bit(
   const { width } = infoHeader
   const height = Math.abs(infoHeader.height)
   const paletteOffset = 14 + infoHeader.headerSize
-  const numColors = infoHeader.colorsUsed || 16
+  const numColors = Math.min(infoHeader.colorsUsed || 16, 16)
   const palette = readPalette(view, paletteOffset, numColors, infoHeader.headerSize === 12 ? 3 : 4)
 
   const rowSize = Math.ceil(width / 2)
@@ -213,7 +250,7 @@ function decode8Bit(
   const { width } = infoHeader
   const height = Math.abs(infoHeader.height)
   const paletteOffset = 14 + infoHeader.headerSize
-  const numColors = infoHeader.colorsUsed || 256
+  const numColors = Math.min(infoHeader.colorsUsed || 256, 256)
   const palette = readPalette(view, paletteOffset, numColors, infoHeader.headerSize === 12 ? 3 : 4)
 
   const paddedRowSize = Math.ceil(width / 4) * 4
@@ -258,11 +295,14 @@ function decode16Bit(
   let bShift = 0
 
   // Check for bit fields compression
-  if (infoHeader.compression === BmpCompression.BITFIELDS) {
-    const maskOffset = 14 + infoHeader.headerSize
-    rMask = view.getUint32(maskOffset, true)
-    gMask = view.getUint32(maskOffset + 4, true)
-    bMask = view.getUint32(maskOffset + 8, true)
+  if (
+    infoHeader.compression === BmpCompression.BITFIELDS
+    || infoHeader.compression === BmpCompression.ALPHABITFIELDS
+  ) {
+    const masks = readBitfieldMasks(view, infoHeader.headerSize, infoHeader.compression)
+    rMask = masks.rMask
+    gMask = masks.gMask
+    bMask = masks.bMask
 
     rShift = countTrailingZeros(rMask)
     gShift = countTrailingZeros(gMask)
@@ -321,6 +361,7 @@ function decode24Bit(
 
 function decode32Bit(
   data: Uint8Array,
+  view: DataView,
   fileHeader: BmpFileHeader,
   infoHeader: BmpInfoHeader,
   pixels: Uint8Array,
@@ -332,19 +373,63 @@ function decode32Bit(
   const rowSize = width * 4
   const dataOffset = fileHeader.dataOffset
 
+  // BI_RGB 32-bit: standard BGRA layout, copy bytes directly.
+  if (
+    infoHeader.compression !== BmpCompression.BITFIELDS
+    && infoHeader.compression !== BmpCompression.ALPHABITFIELDS
+  ) {
+    for (let y = 0; y < height; y++) {
+      const srcY = isBottomUp ? height - 1 - y : y
+      const rowOffset = dataOffset + srcY * rowSize
+
+      for (let x = 0; x < width; x++) {
+        const srcOffset = rowOffset + x * 4
+        const pixelOffset = (y * width + x) * 4
+
+        // BMP stores BGRA
+        pixels[pixelOffset] = data[srcOffset + 2] // R
+        pixels[pixelOffset + 1] = data[srcOffset + 1] // G
+        pixels[pixelOffset + 2] = data[srcOffset] // B
+        pixels[pixelOffset + 3] = data[srcOffset + 3] // A
+      }
+    }
+    return
+  }
+
+  // BI_BITFIELDS / BI_ALPHABITFIELDS: channel positions are defined by masks.
+  const masks = readBitfieldMasks(view, infoHeader.headerSize, infoHeader.compression)
+  const { rMask, gMask, bMask, aMask } = masks
+
+  const rShift = countTrailingZeros(rMask)
+  const gShift = countTrailingZeros(gMask)
+  const bShift = countTrailingZeros(bMask)
+  const aShift = aMask ? countTrailingZeros(aMask) : 0
+
+  // Use unsigned shift so a top-bit mask like 0xFF000000 doesn't sign-extend.
+  const rRange = (rMask >>> rShift) || 1
+  const gRange = (gMask >>> gShift) || 1
+  const bRange = (bMask >>> bShift) || 1
+  const aRange = aMask ? ((aMask >>> aShift) || 1) : 0
+
+  const rScale = 255 / rRange
+  const gScale = 255 / gRange
+  const bScale = 255 / bRange
+  const aScale = aRange ? 255 / aRange : 0
+
   for (let y = 0; y < height; y++) {
     const srcY = isBottomUp ? height - 1 - y : y
     const rowOffset = dataOffset + srcY * rowSize
 
     for (let x = 0; x < width; x++) {
-      const srcOffset = rowOffset + x * 4
+      const pixel = view.getUint32(rowOffset + x * 4, true)
       const pixelOffset = (y * width + x) * 4
 
-      // BMP stores BGRA
-      pixels[pixelOffset] = data[srcOffset + 2] // R
-      pixels[pixelOffset + 1] = data[srcOffset + 1] // G
-      pixels[pixelOffset + 2] = data[srcOffset] // B
-      pixels[pixelOffset + 3] = data[srcOffset + 3] // A
+      pixels[pixelOffset] = Math.round(((pixel & rMask) >>> rShift) * rScale)
+      pixels[pixelOffset + 1] = Math.round(((pixel & gMask) >>> gShift) * gScale)
+      pixels[pixelOffset + 2] = Math.round(((pixel & bMask) >>> bShift) * bScale)
+      pixels[pixelOffset + 3] = aMask
+        ? Math.round(((pixel & aMask) >>> aShift) * aScale)
+        : 255
     }
   }
 }
@@ -360,7 +445,7 @@ function decodeRLE8(
   const height = Math.abs(infoHeader.height)
   const paletteOffset = 14 + infoHeader.headerSize
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-  const numColors = infoHeader.colorsUsed || 256
+  const numColors = Math.min(infoHeader.colorsUsed || 256, 256)
   const palette = readPalette(view, paletteOffset, numColors)
 
   let x = 0
@@ -434,7 +519,7 @@ function decodeRLE4(
   const height = Math.abs(infoHeader.height)
   const paletteOffset = 14 + infoHeader.headerSize
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-  const numColors = infoHeader.colorsUsed || 16
+  const numColors = Math.min(infoHeader.colorsUsed || 16, 16)
   const palette = readPalette(view, paletteOffset, numColors)
 
   let x = 0

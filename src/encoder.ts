@@ -11,6 +11,19 @@ export function encode(imageData: BmpImageData, options: BmpEncodeOptions = {}):
     throw new Error('Only 24 and 32 bits per pixel are supported for encoding')
   }
 
+  if (!Number.isInteger(width) || width <= 0)
+    throw new Error(`Invalid image width: must be a positive integer, got ${width}`)
+
+  if (!Number.isInteger(height) || height <= 0)
+    throw new Error(`Invalid image height: must be a positive integer, got ${height}`)
+
+  const expectedDataLength = width * height * 4
+  if (data.length !== expectedDataLength) {
+    throw new Error(
+      `Invalid image data length: expected ${expectedDataLength} bytes (${width}x${height}x4 RGBA), got ${data.length}`,
+    )
+  }
+
   const hasAlpha = bitsPerPixel === 32
 
   // Calculate row size (must be padded to 4-byte boundary)

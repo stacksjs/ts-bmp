@@ -393,4 +393,190 @@ describe('ts-bmp', () => {
       expect(decoded.data.length).toBe(1000 * 1000 * 4)
     }, 10000)
   })
+
+  describe('input validation', () => {
+    describe('encode', () => {
+      it('rejects zero width', () => {
+        expect(() => bmp.encode({ data: new Uint8Array(0), width: 0, height: 10 }))
+          .toThrow(/positive integer/)
+      })
+
+      it('rejects negative height', () => {
+        expect(() => bmp.encode({ data: new Uint8Array(40), width: 10, height: -1 }))
+          .toThrow(/positive integer/)
+      })
+
+      it('rejects non-integer dimensions', () => {
+        expect(() => bmp.encode({ data: new Uint8Array(40), width: 10.5, height: 10 }))
+          .toThrow(/positive integer/)
+      })
+
+      it('rejects mismatched data length', () => {
+        // 10x10 RGBA needs 400 bytes; supply 100.
+        expect(() => bmp.encode({ data: new Uint8Array(100), width: 10, height: 10 }))
+          .toThrow(/expected 400 bytes/)
+      })
+
+      it('accepts exact-length data', () => {
+        const data = new Uint8Array(10 * 10 * 4)
+        expect(() => bmp.encode({ data, width: 10, height: 10 })).not.toThrow()
+      })
+    })
+
+    describe('decode', () => {
+      it('rejects buffers smaller than the minimum header size', () => {
+        expect(() => bmp.decode(new Uint8Array(4)))
+          .toThrow(/buffer too small/)
+      })
+
+      it('rejects buffers truncated mid-header', () => {
+        // Valid BM signature + claimed 108-byte info header but actual buffer too short.
+        const buf = new Uint8Array(40)
+        buf[0] = 0x42 // 'B'
+        buf[1] = 0x4D // 'M'
+        const view = new DataView(buf.buffer)
+        view.setUint32(14, 108, true) // headerSize = 108 (BITMAPV4HEADER)
+        expect(() => bmp.decode(buf)).toThrow(/truncated/)
+      })
+
+      it('still rejects bad signatures with a clear error', () => {
+        const buf = new Uint8Array(64)
+        buf[0] = 0x00
+        buf[1] = 0x00
+        const view = new DataView(buf.buffer)
+        view.setUint32(14, 40, true) // pretend a 40-byte header so length check passes
+        expect(() => bmp.decode(buf)).toThrow(/missing BM signature/)
+      })
+    })
+  })
+
+  describe('decode32Bit honors BITFIELDS masks', () => {
+    // Build a 32-bit BMP with a non-default channel layout so that a decoder
+    // which hardcodes BGRA will visibly swap channels. We use BITMAPV4HEADER
+    // and store pixels as RGBA in memory order (R first instead of B first).
+    function buildRgbaBitfieldsBmp(width: number, height: number, pixelsRgba: Uint8Array): Uint8Array {
+      const headerSize = 14
+      const infoHeaderSize = 108
+      const rowSize = width * 4
+      const fileSize = headerSize + infoHeaderSize + rowSize * height
+      const buf = new Uint8Array(fileSize)
+      const view = new DataView(buf.buffer)
+
+      // File header
+      view.setUint16(0, 0x4D42, true)
+      view.setUint32(2, fileSize, true)
+      view.setUint32(10, headerSize + infoHeaderSize, true)
+
+      // BITMAPV4HEADER
+      view.setUint32(14, 108, true)
+      view.setInt32(18, width, true)
+      view.setInt32(22, height, true)
+      view.setUint16(26, 1, true)
+      view.setUint16(28, 32, true)
+      view.setUint32(30, 3, true) // BI_BITFIELDS
+      view.setUint32(34, rowSize * height, true)
+      // Masks for in-memory order R, G, B, A (i.e. when read as little-endian
+      // uint32 the layout is A<<24 | B<<16 | G<<8 | R).
+      view.setUint32(54, 0x000000FF, true) // R mask
+      view.setUint32(58, 0x0000FF00, true) // G mask
+      view.setUint32(62, 0x00FF0000, true) // B mask
+      view.setUint32(66, 0xFF000000, true) // A mask
+
+      // Pixel data, bottom-up, RGBA byte order.
+      const dataOffset = headerSize + infoHeaderSize
+      for (let y = 0; y < height; y++) {
+        const srcY = height - 1 - y
+        for (let x = 0; x < width; x++) {
+          const src = (srcY * width + x) * 4
+          const dst = dataOffset + y * rowSize + x * 4
+          buf[dst] = pixelsRgba[src] // R
+          buf[dst + 1] = pixelsRgba[src + 1] // G
+          buf[dst + 2] = pixelsRgba[src + 2] // B
+          buf[dst + 3] = pixelsRgba[src + 3] // A
+        }
+      }
+      return buf
+    }
+
+    it('decodes RGBA-ordered 32-bit BITFIELDS without swapping channels', () => {
+      const width = 4
+      const height = 4
+      const pixels = new Uint8Array(width * height * 4)
+      for (let i = 0; i < width * height; i++) {
+        pixels[i * 4] = 200 // R
+        pixels[i * 4 + 1] = 100 // G
+        pixels[i * 4 + 2] = 50 // B
+        pixels[i * 4 + 3] = 180 // A
+      }
+
+      const decoded = bmp.decode(buildRgbaBitfieldsBmp(width, height, pixels))
+
+      expect(decoded.width).toBe(width)
+      expect(decoded.height).toBe(height)
+      expect(decoded.data[0]).toBe(200)
+      expect(decoded.data[1]).toBe(100)
+      expect(decoded.data[2]).toBe(50)
+      expect(decoded.data[3]).toBe(180)
+    })
+  })
+
+  describe('palette clamping', () => {
+    // Builds a tiny 8-bit BMP with a deliberately-bogus colorsUsed to make
+    // sure we don't read past the palette into pixel data.
+    function build8BitBmpWithBadColorsUsed(): Uint8Array {
+      const width = 2
+      const height = 2
+      const headerSize = 14
+      const infoHeaderSize = 40
+      const paletteSize = 256 * 4
+      const paddedRow = Math.ceil(width / 4) * 4
+      const pixelDataSize = paddedRow * height
+      const fileSize = headerSize + infoHeaderSize + paletteSize + pixelDataSize
+      const buf = new Uint8Array(fileSize)
+      const view = new DataView(buf.buffer)
+
+      view.setUint16(0, 0x4D42, true)
+      view.setUint32(2, fileSize, true)
+      view.setUint32(10, headerSize + infoHeaderSize + paletteSize, true)
+
+      view.setUint32(14, 40, true)
+      view.setInt32(18, width, true)
+      view.setInt32(22, height, true)
+      view.setUint16(26, 1, true)
+      view.setUint16(28, 8, true)
+      view.setUint32(30, 0, true)
+      view.setUint32(34, pixelDataSize, true)
+      // Lie about colorsUsed: claim 9999 even though max for 8-bit is 256.
+      view.setUint32(46, 9999, true)
+
+      // Palette: index 0 = black, index 1 = pure red (BGRA in BMP order).
+      const palOffset = headerSize + infoHeaderSize
+      buf[palOffset + 4 + 0] = 0 // B
+      buf[palOffset + 4 + 1] = 0 // G
+      buf[palOffset + 4 + 2] = 255 // R
+      buf[palOffset + 4 + 3] = 0 // reserved
+
+      // Fill 2x2 pixels with index 1 (red).
+      const pixOffset = palOffset + paletteSize
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          buf[pixOffset + y * paddedRow + x] = 1
+        }
+      }
+      return buf
+    }
+
+    it('clamps oversized colorsUsed without crashing or corrupting output', () => {
+      const decoded = bmp.decode(build8BitBmpWithBadColorsUsed())
+      expect(decoded.width).toBe(2)
+      expect(decoded.height).toBe(2)
+      // All four pixels should decode to red (palette index 1).
+      for (let i = 0; i < 4; i++) {
+        expect(decoded.data[i * 4]).toBe(255)
+        expect(decoded.data[i * 4 + 1]).toBe(0)
+        expect(decoded.data[i * 4 + 2]).toBe(0)
+        expect(decoded.data[i * 4 + 3]).toBe(255)
+      }
+    })
+  })
 })

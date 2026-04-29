@@ -1,6 +1,6 @@
 {
   "name": "ts-bmp",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "A pure TypeScript BMP encoder and decoder with zero dependencies",
   "author": "Chris Breuer <chris@stacksjs.org>",
   "license": "MIT",
@@ -40,7 +40,7 @@
   "scripts": {
     "build": "bun --bun build.ts",
     "test": "bun test",
-    "lint": "eslint .",
+    "lint": "pickier .",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run build",
     "changelog": "bunx logsmith --verbose",
@@ -51,8 +51,7 @@
     "release:major": "bun --bun run changelog:generate && bunx --bun bumpx major --yes"
   },
   "devDependencies": {
-    "@stacksjs/eslint-config": "^4.5.1",
-    "bun-plugin-dtsx": "^0.21.12",
+    "better-dx": "^0.2.7",
     "typescript": "^5.7.3"
   }
 }

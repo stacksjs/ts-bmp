@@ -54,14 +54,16 @@ const bmp24 = encode(imageData, { bitsPerPixel: 24 })
 
 ## API
 
-### `decode(buffer: Uint8Array): BmpImageData`
+### `decode(buffer: Uint8Array | ArrayBuffer): BmpImageData`
 
-Decodes a BMP image buffer to RGBA pixel data.
+Decodes a BMP image buffer to RGBA pixel data. Accepts either a `Uint8Array` or a raw `ArrayBuffer`.
 
 **Returns:**
 - `data: Uint8Array` - RGBA pixel data (4 bytes per pixel)
 - `width: number` - Image width in pixels
 - `height: number` - Image height in pixels
+
+**Throws:** if the buffer is too short to contain a BMP header, lacks the `BM` signature, or has a bit depth that isn't supported.
 
 ### `encode(imageData: BmpImageData, options?: BmpEncodeOptions): Uint8Array`
 
@@ -69,6 +71,8 @@ Encodes RGBA pixel data to BMP format.
 
 **Options:**
 - `bitsPerPixel: 24 | 32` - Bits per pixel (default: 32)
+
+**Throws:** if `bitsPerPixel` isn't 24 or 32, if `width`/`height` aren't positive integers, or if `data.length` doesn't equal `width * height * 4`.
 
 ## Supported Formats
 
