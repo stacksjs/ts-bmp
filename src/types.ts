@@ -1,9 +1,14 @@
 /**
- * BMP image data
+ * BMP image data.
+ *
+ * `data` is RGBA pixel bytes (4 per pixel). Both `Uint8Array` and
+ * `Uint8ClampedArray` are accepted on input so Canvas `ImageData` (whose
+ * `.data` is `Uint8ClampedArray`) can be passed straight to `encode()`.
+ * `decode()` always returns a `Uint8Array`.
  */
 export interface BmpImageData {
   /** Pixel data in RGBA format (4 bytes per pixel) */
-  data: Uint8Array
+  data: Uint8Array | Uint8ClampedArray
   /** Image width in pixels */
   width: number
   /** Image height in pixels */

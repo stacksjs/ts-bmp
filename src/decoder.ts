@@ -1,6 +1,20 @@
 import type { BmpFileHeader, BmpImageData, BmpInfoHeader } from './types'
 import { BmpCompression } from './types'
 
+// Known BMP info-header sizes:
+//   12  = BITMAPCOREHEADER (OS/2 1.x)
+//   40  = BITMAPINFOHEADER
+//   52  = BITMAPV2INFOHEADER (RGB masks)
+//   56  = BITMAPV3INFOHEADER (adds alpha mask)
+//   64  = OS22XBITMAPHEADER  (OS/2 2.x; first 40 bytes match BITMAPINFOHEADER)
+//   108 = BITMAPV4HEADER
+//   124 = BITMAPV5HEADER
+const KNOWN_HEADER_SIZES = new Set([12, 40, 52, 56, 64, 108, 124])
+
+// Generous cap on per-side dimensions. Real BMPs are nowhere near this; the
+// limit exists so a malformed file can't make us attempt a many-GB allocation.
+const MAX_DIMENSION = 65535
+
 /**
  * Decode a BMP image buffer to RGBA pixel data.
  * Accepts either a `Uint8Array` or an `ArrayBuffer`.
@@ -27,9 +41,15 @@ export function decode(buffer: Uint8Array | ArrayBuffer): BmpImageData {
       `Invalid BMP file: buffer truncated (info header claims ${declaredHeaderSize} bytes, only ${data.byteLength - 14} available)`,
     )
   }
+  if (!KNOWN_HEADER_SIZES.has(declaredHeaderSize)) {
+    throw new Error(
+      `Invalid BMP file: unknown info header size ${declaredHeaderSize} (expected one of ${[...KNOWN_HEADER_SIZES].join(', ')})`,
+    )
+  }
   const infoHeader = readInfoHeader(view, 14)
 
-  // Handle different bit depths
+  validateHeaders(fileHeader, infoHeader, data.byteLength)
+
   const { width } = infoHeader
   const height = Math.abs(infoHeader.height)
   const isBottomUp = infoHeader.height > 0
@@ -122,6 +142,74 @@ function readInfoHeader(view: DataView, offset: number): BmpInfoHeader {
     yPixelsPerMeter: view.getInt32(offset + 28, true),
     colorsUsed: view.getUint32(offset + 32, true),
     colorsImportant: view.getUint32(offset + 36, true),
+  }
+}
+
+/**
+ * Validate dimensions, compression, and pixel-data offset before any decoder
+ * is dispatched. Throws with a descriptive message; never returns a "best
+ * effort" result for a malformed file.
+ */
+function validateHeaders(
+  fileHeader: BmpFileHeader,
+  infoHeader: BmpInfoHeader,
+  byteLength: number,
+): void {
+  // Dimensions
+  if (infoHeader.width <= 0)
+    throw new Error(`Invalid BMP: non-positive width (${infoHeader.width})`)
+
+  const absHeight = Math.abs(infoHeader.height)
+  if (absHeight === 0)
+    throw new Error('Invalid BMP: zero height')
+
+  if (infoHeader.width > MAX_DIMENSION || absHeight > MAX_DIMENSION) {
+    throw new Error(
+      `Invalid BMP: dimensions ${infoHeader.width}x${absHeight} exceed maximum ${MAX_DIMENSION}`,
+    )
+  }
+
+  // Compression must be appropriate for the bit depth.
+  const { bitsPerPixel, compression } = infoHeader
+  switch (compression) {
+    case BmpCompression.RGB:
+      // Always valid for any supported bit depth.
+      break
+    case BmpCompression.RLE8:
+      if (bitsPerPixel !== 8)
+        throw new Error(`Invalid BMP: RLE8 compression requires 8 bpp, got ${bitsPerPixel}`)
+      break
+    case BmpCompression.RLE4:
+      if (bitsPerPixel !== 4)
+        throw new Error(`Invalid BMP: RLE4 compression requires 4 bpp, got ${bitsPerPixel}`)
+      break
+    case BmpCompression.BITFIELDS:
+    case BmpCompression.ALPHABITFIELDS:
+      if (bitsPerPixel !== 16 && bitsPerPixel !== 32) {
+        throw new Error(
+          `Invalid BMP: BITFIELDS compression requires 16 or 32 bpp, got ${bitsPerPixel}`,
+        )
+      }
+      break
+    case BmpCompression.JPEG:
+      throw new Error('Unsupported BMP: embedded JPEG compression is not supported')
+    case BmpCompression.PNG:
+      throw new Error('Unsupported BMP: embedded PNG compression is not supported')
+    default:
+      throw new Error(`Unsupported BMP compression value: ${compression}`)
+  }
+
+  // Pixel data offset must point past the headers and stay within the buffer.
+  const headerEnd = 14 + infoHeader.headerSize
+  if (fileHeader.dataOffset < headerEnd) {
+    throw new Error(
+      `Invalid BMP: pixel data offset (${fileHeader.dataOffset}) overlaps headers (end at ${headerEnd})`,
+    )
+  }
+  if (fileHeader.dataOffset > byteLength) {
+    throw new Error(
+      `Invalid BMP: pixel data offset (${fileHeader.dataOffset}) past end of buffer (${byteLength})`,
+    )
   }
 }
 
@@ -309,9 +397,11 @@ function decode16Bit(
     bShift = countTrailingZeros(bMask)
   }
 
-  const rScale = 255 / (rMask >> rShift)
-  const gScale = 255 / (gMask >> gShift)
-  const bScale = 255 / (bMask >> bShift)
+  // Use unsigned shift for consistency with decode32Bit; harmless here since
+  // 16-bit masks never have the sign bit set, but keeps the two paths aligned.
+  const rScale = 255 / ((rMask >>> rShift) || 1)
+  const gScale = 255 / ((gMask >>> gShift) || 1)
+  const bScale = 255 / ((bMask >>> bShift) || 1)
 
   for (let y = 0; y < height; y++) {
     const srcY = isBottomUp ? height - 1 - y : y
@@ -321,9 +411,9 @@ function decode16Bit(
       const pixel = view.getUint16(rowOffset + x * 2, true)
 
       const pixelOffset = (y * width + x) * 4
-      pixels[pixelOffset] = Math.round(((pixel & rMask) >> rShift) * rScale)
-      pixels[pixelOffset + 1] = Math.round(((pixel & gMask) >> gShift) * gScale)
-      pixels[pixelOffset + 2] = Math.round(((pixel & bMask) >> bShift) * bScale)
+      pixels[pixelOffset] = Math.round(((pixel & rMask) >>> rShift) * rScale)
+      pixels[pixelOffset + 1] = Math.round(((pixel & gMask) >>> gShift) * gScale)
+      pixels[pixelOffset + 2] = Math.round(((pixel & bMask) >>> bShift) * bScale)
       pixels[pixelOffset + 3] = 255
     }
   }
@@ -452,7 +542,17 @@ function decodeRLE8(
   let y = isBottomUp ? height - 1 : 0
   let i = fileHeader.dataOffset
 
-  while (i < data.length) {
+  const ensure = (need: number, label: string) => {
+    if (i + need > data.length) {
+      throw new Error(
+        `Truncated BMP RLE8 stream: ${label} (need ${need} more byte(s) at offset ${i}, have ${data.length - i})`,
+      )
+    }
+  }
+
+  // Loop until explicit end-of-bitmap (0,1) escape; throw if truncated.
+  while (true) {
+    ensure(2, 'opcode')
     const count = data[i++]
     const value = data[i++]
 
@@ -469,15 +569,18 @@ function decodeRLE8(
       }
       else if (value === 2) {
         // Delta
+        ensure(2, 'delta escape')
         x += data[i++]
         const dy = data[i++]
         y = isBottomUp ? y - dy : y + dy
       }
       else {
-        // Absolute mode
+        // Absolute mode: `value` data bytes, padded to 16-bit word boundary.
+        const padded = value + (value & 1)
+        ensure(padded, 'absolute run')
         for (let j = 0; j < value && y >= 0 && y < height; j++) {
-          const colorIndex = data[i++]
-          if (x < width) {
+          const colorIndex = data[i + j]
+          if (x < width && colorIndex < numColors) {
             const pixelOffset = (y * width + x) * 4
             pixels[pixelOffset] = palette[colorIndex * 4]
             pixels[pixelOffset + 1] = palette[colorIndex * 4 + 1]
@@ -486,16 +589,14 @@ function decodeRLE8(
             x++
           }
         }
-        // Pad to word boundary
-        if (value % 2 !== 0) {
-          i++
-        }
+        i += padded
       }
     }
     else {
       // Run-length encoded
+      const validIndex = value < numColors
       for (let j = 0; j < count && y >= 0 && y < height; j++) {
-        if (x < width) {
+        if (x < width && validIndex) {
           const pixelOffset = (y * width + x) * 4
           pixels[pixelOffset] = palette[value * 4]
           pixels[pixelOffset + 1] = palette[value * 4 + 1]
@@ -526,7 +627,16 @@ function decodeRLE4(
   let y = isBottomUp ? height - 1 : 0
   let i = fileHeader.dataOffset
 
-  while (i < data.length) {
+  const ensure = (need: number, label: string) => {
+    if (i + need > data.length) {
+      throw new Error(
+        `Truncated BMP RLE4 stream: ${label} (need ${need} more byte(s) at offset ${i}, have ${data.length - i})`,
+      )
+    }
+  }
+
+  while (true) {
+    ensure(2, 'opcode')
     const count = data[i++]
     const value = data[i++]
 
@@ -542,18 +652,23 @@ function decodeRLE4(
       }
       else if (value === 2) {
         // Delta
+        ensure(2, 'delta escape')
         x += data[i++]
         const dy = data[i++]
         y = isBottomUp ? y - dy : y + dy
       }
       else {
-        // Absolute mode
+        // Absolute mode: `value` nibbles packed into ceil(value/2) bytes,
+        // padded to a 16-bit word boundary.
+        const dataBytes = (value + 1) >> 1
+        const padded = dataBytes + (dataBytes & 1)
+        ensure(padded, 'absolute run')
         for (let j = 0; j < value && y >= 0 && y < height; j++) {
-          const byteIndex = Math.floor(j / 2)
-          const nibbleIndex = 1 - (j % 2)
+          const byteIndex = j >> 1
+          const nibbleIndex = 1 - (j & 1)
           const colorIndex = (data[i + byteIndex] >> (nibbleIndex * 4)) & 0x0F
 
-          if (x < width) {
+          if (x < width && colorIndex < numColors) {
             const pixelOffset = (y * width + x) * 4
             pixels[pixelOffset] = palette[colorIndex * 4]
             pixels[pixelOffset + 1] = palette[colorIndex * 4 + 1]
@@ -562,22 +677,21 @@ function decodeRLE4(
             x++
           }
         }
-        // Advance past the data
-        i += Math.ceil(value / 2)
-        // Pad to word boundary
-        if (Math.ceil(value / 2) % 2 !== 0) {
-          i++
-        }
+        i += padded
       }
     }
     else {
       // Run-length encoded (alternating nibbles)
       const color1 = (value >> 4) & 0x0F
       const color2 = value & 0x0F
+      const valid1 = color1 < numColors
+      const valid2 = color2 < numColors
 
       for (let j = 0; j < count && y >= 0 && y < height; j++) {
-        const colorIndex = j % 2 === 0 ? color1 : color2
-        if (x < width) {
+        const useFirst = (j & 1) === 0
+        const colorIndex = useFirst ? color1 : color2
+        const valid = useFirst ? valid1 : valid2
+        if (x < width && valid) {
           const pixelOffset = (y * width + x) * 4
           pixels[pixelOffset] = palette[colorIndex * 4]
           pixels[pixelOffset + 1] = palette[colorIndex * 4 + 1]

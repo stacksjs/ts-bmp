@@ -1,4 +1,3 @@
-import { Buffer } from 'node:buffer'
 import { describe, expect, it } from 'bun:test'
 import bmp from '../src'
 
@@ -577,6 +576,211 @@ describe('ts-bmp', () => {
         expect(decoded.data[i * 4 + 2]).toBe(0)
         expect(decoded.data[i * 4 + 3]).toBe(255)
       }
+    })
+  })
+
+  describe('malformed input rejection', () => {
+    // A byte-level "patch" helper. Writes a small set of fields into a copy of
+    // an otherwise-valid BMP so each test can express *one* malformation
+    // cheaply without rebuilding a whole BMP from scratch.
+    type Patch
+      = | { offset: number, type: 'u16', value: number }
+        | { offset: number, type: 'u32', value: number }
+        | { offset: number, type: 'i32', value: number }
+
+    function patch(buf: Uint8Array, patches: Patch[]): Uint8Array {
+      const copy = new Uint8Array(buf)
+      const view = new DataView(copy.buffer)
+      for (const p of patches) {
+        if (p.type === 'u16')
+          view.setUint16(p.offset, p.value, true)
+        else if (p.type === 'u32')
+          view.setUint32(p.offset, p.value, true)
+        else
+          view.setInt32(p.offset, p.value, true)
+      }
+      return copy
+    }
+
+    function validBmp(): Uint8Array {
+      return bmp.encode(createTestImageData(4, 4, { r: 1, g: 2, b: 3, a: 255 }))
+    }
+
+    it('rejects negative width', () => {
+      // Field offsets: width @ 18 (i32), height @ 22 (i32).
+      const bad = patch(validBmp(), [{ offset: 18, type: 'i32', value: -5 }])
+      expect(() => bmp.decode(bad)).toThrow(/non-positive width/)
+    })
+
+    it('rejects zero width', () => {
+      const bad = patch(validBmp(), [{ offset: 18, type: 'i32', value: 0 }])
+      expect(() => bmp.decode(bad)).toThrow(/non-positive width/)
+    })
+
+    it('rejects zero height', () => {
+      const bad = patch(validBmp(), [{ offset: 22, type: 'i32', value: 0 }])
+      expect(() => bmp.decode(bad)).toThrow(/zero height/)
+    })
+
+    it('accepts top-down orientation (negative height)', () => {
+      // Negative height is legal — it just means top-down. Patch height to -4
+      // and the row order in the buffer no longer matches, but the decoder
+      // shouldn't *reject* the file based on the sign alone. We only check
+      // that no error is thrown; pixel layout will be mirrored, which is
+      // expected behavior given how BMP top-down works.
+      const bad = patch(validBmp(), [{ offset: 22, type: 'i32', value: -4 }])
+      expect(() => bmp.decode(bad)).not.toThrow()
+    })
+
+    it('rejects dimensions over the maximum', () => {
+      const bad = patch(validBmp(), [{ offset: 18, type: 'i32', value: 100000 }])
+      expect(() => bmp.decode(bad)).toThrow(/exceed maximum/)
+    })
+
+    it('rejects unknown info header sizes', () => {
+      // headerSize @ 14 (u32). A claimed 13-byte header is nonsense.
+      const bad = patch(validBmp(), [{ offset: 14, type: 'u32', value: 13 }])
+      expect(() => bmp.decode(bad)).toThrow(/unknown info header size/)
+    })
+
+    it('rejects embedded JPEG compression', () => {
+      // compression @ 30 (u32). Set to 4 (JPEG) and bpp to 24 to avoid the
+      // "BITFIELDS requires 16/32 bpp" check firing first.
+      const bad = patch(validBmp(), [
+        { offset: 30, type: 'u32', value: 4 }, // BI_JPEG
+        { offset: 28, type: 'u16', value: 24 }, // bpp
+      ])
+      expect(() => bmp.decode(bad)).toThrow(/JPEG compression is not supported/)
+    })
+
+    it('rejects embedded PNG compression', () => {
+      const bad = patch(validBmp(), [
+        { offset: 30, type: 'u32', value: 5 }, // BI_PNG
+        { offset: 28, type: 'u16', value: 24 },
+      ])
+      expect(() => bmp.decode(bad)).toThrow(/PNG compression is not supported/)
+    })
+
+    it('rejects unknown compression values', () => {
+      const bad = patch(validBmp(), [
+        { offset: 30, type: 'u32', value: 99 },
+        { offset: 28, type: 'u16', value: 24 },
+      ])
+      expect(() => bmp.decode(bad)).toThrow(/Unsupported BMP compression value/)
+    })
+
+    it('rejects RLE8 paired with non-8 bpp', () => {
+      const bad = patch(validBmp(), [
+        { offset: 30, type: 'u32', value: 1 }, // RLE8
+        { offset: 28, type: 'u16', value: 24 },
+      ])
+      expect(() => bmp.decode(bad)).toThrow(/RLE8 compression requires 8 bpp/)
+    })
+
+    it('rejects BITFIELDS paired with 8 bpp', () => {
+      const bad = patch(validBmp(), [
+        { offset: 30, type: 'u32', value: 3 }, // BITFIELDS
+        { offset: 28, type: 'u16', value: 8 },
+      ])
+      expect(() => bmp.decode(bad)).toThrow(/BITFIELDS compression requires 16 or 32 bpp/)
+    })
+
+    it('rejects dataOffset past end of buffer', () => {
+      // dataOffset @ 10 (u32).
+      const buf = validBmp()
+      const bad = patch(buf, [{ offset: 10, type: 'u32', value: buf.length + 100 }])
+      expect(() => bmp.decode(bad)).toThrow(/past end of buffer/)
+    })
+
+    it('rejects dataOffset overlapping headers', () => {
+      const bad = patch(validBmp(), [{ offset: 10, type: 'u32', value: 20 }])
+      expect(() => bmp.decode(bad)).toThrow(/overlaps headers/)
+    })
+  })
+
+  describe('RLE truncation', () => {
+    function buildRle8Header(rlePayload: Uint8Array): Uint8Array {
+      const headerSize = 14
+      const infoHeaderSize = 40
+      const paletteSize = 256 * 4
+      const dataOffset = headerSize + infoHeaderSize + paletteSize
+      const buf = new Uint8Array(dataOffset + rlePayload.length)
+      const view = new DataView(buf.buffer)
+
+      view.setUint16(0, 0x4D42, true)
+      view.setUint32(2, buf.length, true)
+      view.setUint32(10, dataOffset, true)
+      view.setUint32(14, 40, true)
+      view.setInt32(18, 4, true) // width
+      view.setInt32(22, 1, true) // height
+      view.setUint16(26, 1, true)
+      view.setUint16(28, 8, true) // 8 bpp
+      view.setUint32(30, 1, true) // RLE8
+      view.setUint32(34, rlePayload.length, true)
+      // Palette index 0 = black; rest left as zeros, fine for this test.
+      buf.set(rlePayload, dataOffset)
+      return buf
+    }
+
+    it('throws on a single-byte RLE8 stream (incomplete opcode)', () => {
+      const truncated = buildRle8Header(new Uint8Array([0x05]))
+      expect(() => bmp.decode(truncated)).toThrow(/Truncated BMP RLE8 stream/)
+    })
+
+    it('throws on an RLE8 absolute run that runs past EOF', () => {
+      // count=0, value=10 → absolute mode reading 10 bytes, but only 0 follow.
+      const truncated = buildRle8Header(new Uint8Array([0x00, 0x0A]))
+      expect(() => bmp.decode(truncated)).toThrow(/Truncated BMP RLE8 stream: absolute run/)
+    })
+
+    it('throws on an RLE8 delta escape with no payload', () => {
+      // count=0, value=2 (delta) needs 2 more bytes; we provide none.
+      const truncated = buildRle8Header(new Uint8Array([0x00, 0x02]))
+      expect(() => bmp.decode(truncated)).toThrow(/Truncated BMP RLE8 stream: delta escape/)
+    })
+
+    it('throws when RLE8 stream lacks an end-of-bitmap marker', () => {
+      // A run that "consumes" all data without ever emitting the (0,1) marker.
+      // count=4, value=0 (palette idx 0) — valid run, but no terminator after.
+      const truncated = buildRle8Header(new Uint8Array([0x04, 0x00]))
+      expect(() => bmp.decode(truncated)).toThrow(/Truncated BMP RLE8 stream: opcode/)
+    })
+  })
+
+  describe('Uint8ClampedArray support', () => {
+    it('accepts Uint8ClampedArray as encode input', () => {
+      const width = 8
+      const height = 8
+      const data = new Uint8ClampedArray(width * height * 4)
+      for (let i = 0; i < width * height; i++) {
+        data[i * 4] = 200
+        data[i * 4 + 1] = 100
+        data[i * 4 + 2] = 50
+        data[i * 4 + 3] = 255
+      }
+
+      const encoded = bmp.encode({ data, width, height })
+      const decoded = bmp.decode(encoded)
+      expect(decoded.width).toBe(width)
+      expect(decoded.height).toBe(height)
+      expect(decoded.data[0]).toBe(200)
+      expect(decoded.data[1]).toBe(100)
+      expect(decoded.data[2]).toBe(50)
+      expect(decoded.data[3]).toBe(255)
+    })
+
+    it('produces identical output for Uint8Array and Uint8ClampedArray inputs', () => {
+      const width = 4
+      const height = 4
+      const u8 = new Uint8Array(width * height * 4)
+      for (let i = 0; i < u8.length; i++) u8[i] = (i * 13) & 0xFF
+      const clamped = new Uint8ClampedArray(u8)
+
+      const a = bmp.encode({ data: u8, width, height })
+      const b = bmp.encode({ data: clamped, width, height })
+      expect(a.length).toBe(b.length)
+      for (let i = 0; i < a.length; i++)
+        expect(b[i]).toBe(a[i])
     })
   })
 })
