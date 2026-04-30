@@ -119,7 +119,7 @@ describe('ts-bmp', () => {
     it('decodes from ArrayBuffer', () => {
       const original = createTestImageData(5, 5, { r: 128, g: 128, b: 128, a: 255 })
       const encoded = bmp.encode(original)
-      const arrayBuffer = encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength)
+      const arrayBuffer = encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength) as ArrayBuffer
       const decoded = bmp.decode(arrayBuffer)
 
       expect(decoded.width).toBe(5)

@@ -3,10 +3,10 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "ts-bmp",
+      "name": "@stacksjs/ts-bmp",
       "devDependencies": {
+        "@types/bun": "latest",
         "better-dx": "^0.2.7",
-        "typescript": "^5.7.3",
       },
     },
   },
