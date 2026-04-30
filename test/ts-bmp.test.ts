@@ -337,24 +337,41 @@ describe('ts-bmp', () => {
       expect(dataOffset).toBeGreaterThan(14) // At least file header size
     })
 
-    it('has correct info header for 32-bit', () => {
+    it('has correct info header for 32-bit with varying alpha (BITMAPV4HEADER)', () => {
+      // Use a non-opaque alpha somewhere so the encoder picks V4+BITFIELDS.
+      const data = new Uint8Array(10 * 10 * 4)
+      for (let i = 0; i < 10 * 10; i++) {
+        data[i * 4] = 128
+        data[i * 4 + 1] = 128
+        data[i * 4 + 2] = 128
+        data[i * 4 + 3] = i === 0 ? 0 : 255 // first pixel transparent → forces V4
+      }
+      const encoded = bmp.encode({ data, width: 10, height: 10 }, { bitsPerPixel: 32 })
+      const view = new DataView(encoded.buffer)
+
+      // Header size should be 108 for BITMAPV4HEADER
+      expect(view.getUint32(14, true)).toBe(108)
+      expect(view.getInt32(18, true)).toBe(10)
+      expect(view.getInt32(22, true)).toBe(10)
+      expect(view.getUint16(26, true)).toBe(1)
+      expect(view.getUint16(28, true)).toBe(32)
+    })
+
+    it('falls back to BITMAPINFOHEADER for fully-opaque 32-bit', () => {
+      // Every alpha is 255 → encoder should emit a 40-byte BITMAPINFOHEADER
+      // with BI_RGB compression (smaller file, broader reader compatibility).
       const imageData = createTestImageData(10, 10, { r: 128, g: 128, b: 128, a: 255 })
       const encoded = bmp.encode(imageData, { bitsPerPixel: 32 })
       const view = new DataView(encoded.buffer)
 
-      // Header size should be 108 for BITMAPV4HEADER
-      const headerSize = view.getUint32(14, true)
-      expect(headerSize).toBe(108)
+      expect(view.getUint32(14, true)).toBe(40) // BITMAPINFOHEADER
+      expect(view.getUint16(28, true)).toBe(32) // bpp still 32
+      expect(view.getUint32(30, true)).toBe(0) // BI_RGB
 
-      // Width and height
-      expect(view.getInt32(18, true)).toBe(10) // Width
-      expect(view.getInt32(22, true)).toBe(10) // Height
-
-      // Planes should be 1
-      expect(view.getUint16(26, true)).toBe(1)
-
-      // Bits per pixel
-      expect(view.getUint16(28, true)).toBe(32)
+      // Round-trip still works through our own decoder.
+      const decoded = bmp.decode(encoded)
+      expect(decoded.data[0]).toBe(128)
+      expect(decoded.data[3]).toBe(255)
     })
 
     it('has correct info header for 24-bit', () => {
@@ -781,6 +798,210 @@ describe('ts-bmp', () => {
       expect(a.length).toBe(b.length)
       for (let i = 0; i < a.length; i++)
         expect(b[i]).toBe(a[i])
+    })
+  })
+
+  describe('planes validation', () => {
+    it('rejects BMPs with planes != 1', () => {
+      // Encode a valid BMP, then patch the planes field (offset 26, u16) to 2.
+      const valid = bmp.encode(createTestImageData(4, 4, { r: 1, g: 2, b: 3, a: 255 }))
+      const bad = new Uint8Array(valid)
+      new DataView(bad.buffer).setUint16(26, 2, true)
+      expect(() => bmp.decode(bad)).toThrow(/planes must be 1/)
+    })
+  })
+
+  describe('indexed encoding (1/4/8-bit)', () => {
+    // Helper to build an image whose pixels cycle through a known palette.
+    function buildPalettizedImage(
+      width: number,
+      height: number,
+      palette: Array<{ r: number, g: number, b: number }>,
+    ): { data: Uint8Array, width: number, height: number } {
+      const data = new Uint8Array(width * height * 4)
+      for (let i = 0; i < width * height; i++) {
+        const c = palette[i % palette.length]
+        data[i * 4] = c.r
+        data[i * 4 + 1] = c.g
+        data[i * 4 + 2] = c.b
+        data[i * 4 + 3] = 255
+      }
+      return { data, width, height }
+    }
+
+    it('round-trips a 1-bit BMP (2-color image)', () => {
+      const original = buildPalettizedImage(8, 4, [
+        { r: 0, g: 0, b: 0 },
+        { r: 255, g: 255, b: 255 },
+      ])
+      const encoded = bmp.encode(original, { bitsPerPixel: 1 })
+
+      // Header sanity: bpp=1, headerSize=40, palette has 2*4=8 bytes after header.
+      const view = new DataView(encoded.buffer)
+      expect(view.getUint32(14, true)).toBe(40)
+      expect(view.getUint16(28, true)).toBe(1)
+      expect(view.getUint32(30, true)).toBe(0) // BI_RGB
+
+      const decoded = bmp.decode(encoded)
+      expect(decoded.width).toBe(8)
+      expect(decoded.height).toBe(4)
+      for (let i = 0; i < original.data.length; i += 4) {
+        expect(decoded.data[i]).toBe(original.data[i])
+        expect(decoded.data[i + 1]).toBe(original.data[i + 1])
+        expect(decoded.data[i + 2]).toBe(original.data[i + 2])
+      }
+    })
+
+    it('round-trips a 4-bit BMP (16-color image)', () => {
+      const palette: Array<{ r: number, g: number, b: number }> = []
+      for (let i = 0; i < 16; i++)
+        palette.push({ r: i * 16, g: 255 - i * 16, b: 128 })
+      const original = buildPalettizedImage(16, 4, palette)
+      const encoded = bmp.encode(original, { bitsPerPixel: 4 })
+
+      const view = new DataView(encoded.buffer)
+      expect(view.getUint16(28, true)).toBe(4)
+
+      const decoded = bmp.decode(encoded)
+      for (let i = 0; i < original.data.length; i += 4) {
+        expect(decoded.data[i]).toBe(original.data[i])
+        expect(decoded.data[i + 1]).toBe(original.data[i + 1])
+        expect(decoded.data[i + 2]).toBe(original.data[i + 2])
+      }
+    })
+
+    it('round-trips an 8-bit BMP (≤256 unique colors)', () => {
+      const palette: Array<{ r: number, g: number, b: number }> = []
+      for (let i = 0; i < 64; i++)
+        palette.push({ r: (i * 4) & 0xFF, g: (i * 7) & 0xFF, b: (i * 11) & 0xFF })
+      const original = buildPalettizedImage(8, 8, palette)
+      const encoded = bmp.encode(original, { bitsPerPixel: 8 })
+
+      const view = new DataView(encoded.buffer)
+      expect(view.getUint16(28, true)).toBe(8)
+      // colorsUsed should reflect actual unique color count (64).
+      expect(view.getUint32(46, true)).toBe(64)
+
+      const decoded = bmp.decode(encoded)
+      for (let i = 0; i < original.data.length; i += 4) {
+        expect(decoded.data[i]).toBe(original.data[i])
+        expect(decoded.data[i + 1]).toBe(original.data[i + 1])
+        expect(decoded.data[i + 2]).toBe(original.data[i + 2])
+      }
+    })
+
+    it('handles row-padding correctly for awkward widths in 1-bit', () => {
+      // Width 9 → ceil(9/8)=2 row bytes → padded to 4 bytes per row.
+      const palette = [{ r: 0, g: 0, b: 0 }, { r: 255, g: 255, b: 255 }]
+      const original = buildPalettizedImage(9, 3, palette)
+      const decoded = bmp.decode(bmp.encode(original, { bitsPerPixel: 1 }))
+      for (let i = 0; i < original.data.length; i += 4) {
+        expect(decoded.data[i]).toBe(original.data[i])
+        expect(decoded.data[i + 1]).toBe(original.data[i + 1])
+        expect(decoded.data[i + 2]).toBe(original.data[i + 2])
+      }
+    })
+
+    it('handles row-padding correctly for awkward widths in 4-bit', () => {
+      // Width 5 → ceil(5/2)=3 row bytes → padded to 4 bytes.
+      const palette = Array.from({ length: 8 }, (_, i) => ({ r: i * 32, g: 0, b: 0 }))
+      const original = buildPalettizedImage(5, 3, palette)
+      const decoded = bmp.decode(bmp.encode(original, { bitsPerPixel: 4 }))
+      for (let i = 0; i < original.data.length; i += 4) {
+        expect(decoded.data[i]).toBe(original.data[i])
+        expect(decoded.data[i + 1]).toBe(original.data[i + 1])
+        expect(decoded.data[i + 2]).toBe(original.data[i + 2])
+      }
+    })
+
+    it('throws when a 1-bit image has more than 2 unique colors', () => {
+      const original = buildPalettizedImage(4, 4, [
+        { r: 0, g: 0, b: 0 },
+        { r: 255, g: 255, b: 255 },
+        { r: 128, g: 128, b: 128 },
+      ])
+      expect(() => bmp.encode(original, { bitsPerPixel: 1 }))
+        .toThrow(/more than 2 unique colors/)
+    })
+
+    it('throws when an 8-bit image has more than 256 unique colors', () => {
+      // 257 distinct colors: a row of i=0..256 with R=i (i wraps at 256 to 0,
+      // so we tweak G to keep them unique).
+      const data = new Uint8Array(257 * 1 * 4)
+      for (let i = 0; i < 257; i++) {
+        data[i * 4] = i & 0xFF
+        data[i * 4 + 1] = i >> 8 // 0 for first 256, 1 for last → makes #257 unique
+        data[i * 4 + 2] = 0
+        data[i * 4 + 3] = 255
+      }
+      expect(() => bmp.encode({ data, width: 257, height: 1 }, { bitsPerPixel: 8 }))
+        .toThrow(/more than 256 unique colors/)
+    })
+
+    it('uses a user-supplied palette and matches each pixel exactly', () => {
+      // Build an image using only colors from a specific palette.
+      const palette = new Uint8Array([
+        10, 20, 30, 255,
+        200, 100, 50, 255,
+        0, 0, 0, 255,
+        255, 255, 255, 255,
+      ])
+      const original = buildPalettizedImage(6, 3, [
+        { r: 10, g: 20, b: 30 },
+        { r: 200, g: 100, b: 50 },
+      ])
+      const encoded = bmp.encode(original, { bitsPerPixel: 4, palette })
+
+      // colorsUsed should be 4 (palette size), not the number actually
+      // referenced by pixels.
+      expect(new DataView(encoded.buffer).getUint32(46, true)).toBe(4)
+
+      const decoded = bmp.decode(encoded)
+      for (let i = 0; i < original.data.length; i += 4) {
+        expect(decoded.data[i]).toBe(original.data[i])
+        expect(decoded.data[i + 1]).toBe(original.data[i + 1])
+        expect(decoded.data[i + 2]).toBe(original.data[i + 2])
+      }
+    })
+
+    it('throws when a pixel color is missing from the user-supplied palette', () => {
+      const palette = new Uint8Array([
+        0, 0, 0, 255,
+        255, 255, 255, 255,
+      ])
+      // Image uses (128,128,128) which is not in the palette.
+      const original = buildPalettizedImage(4, 4, [{ r: 128, g: 128, b: 128 }])
+      expect(() => bmp.encode(original, { bitsPerPixel: 1, palette }))
+        .toThrow(/not present in supplied palette/)
+    })
+
+    it('throws when supplied palette length is not a multiple of 4', () => {
+      const palette = new Uint8Array([0, 0, 0])
+      const original = buildPalettizedImage(2, 2, [{ r: 0, g: 0, b: 0 }])
+      expect(() => bmp.encode(original, { bitsPerPixel: 1, palette }))
+        .toThrow(/multiple of 4/)
+    })
+
+    it('throws when supplied palette has more entries than the bit depth allows', () => {
+      // 3 entries for 1-bit (max 2).
+      const palette = new Uint8Array(3 * 4)
+      const original = buildPalettizedImage(2, 2, [{ r: 0, g: 0, b: 0 }])
+      expect(() => bmp.encode(original, { bitsPerPixel: 1, palette }))
+        .toThrow(/exceeds maximum 2 for 1-bit/)
+    })
+
+    it('throws when palette option is combined with 24-bit encoding', () => {
+      const palette = new Uint8Array([0, 0, 0, 255])
+      const original = createTestImageData(2, 2, { r: 0, g: 0, b: 0, a: 255 })
+      expect(() => bmp.encode(original, { bitsPerPixel: 24, palette }))
+        .toThrow(/only applies to 1\/4\/8-bit/)
+    })
+
+    it('rejects unsupported bitsPerPixel values', () => {
+      const original = createTestImageData(2, 2, { r: 0, g: 0, b: 0, a: 255 })
+      // @ts-expect-error testing invalid input
+      expect(() => bmp.encode(original, { bitsPerPixel: 16 }))
+        .toThrow(/Unsupported bitsPerPixel/)
     })
   })
 })

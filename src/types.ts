@@ -19,8 +19,28 @@ export interface BmpImageData {
  * BMP encoding options
  */
 export interface BmpEncodeOptions {
-  /** Bits per pixel (24 or 32, default: 32 for alpha support) */
-  bitsPerPixel?: 24 | 32
+  /**
+   * Bits per pixel. Default: 32.
+   *
+   * - `1` / `4` / `8`: indexed (palette-based). The palette is built from the
+   *   image's unique colors unless one is supplied via `palette`. Alpha is
+   *   discarded for indexed encodings.
+   * - `24`: BGR, no alpha.
+   * - `32`: BGRA. If every alpha byte is 255 the encoder writes a compact
+   *   `BITMAPINFOHEADER` (40 bytes) for maximum reader compatibility;
+   *   otherwise it writes a `BITMAPV4HEADER` with explicit BITFIELDS masks
+   *   so transparency is preserved.
+   */
+  bitsPerPixel?: 1 | 4 | 8 | 24 | 32
+  /**
+   * Optional palette for 1/4/8-bit encoding. RGBA bytes (alpha is ignored —
+   * use 255 in each entry's alpha slot). Length must be a multiple of 4 and
+   * must not exceed 2^bitsPerPixel entries.
+   *
+   * If supplied, every pixel's RGB must match an entry exactly, otherwise
+   * encoding throws (this library does not perform color quantization).
+   */
+  palette?: Uint8Array | Uint8ClampedArray
 }
 
 /**

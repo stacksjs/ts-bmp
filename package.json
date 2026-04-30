@@ -1,6 +1,6 @@
 {
-  "name": "ts-bmp",
-  "version": "0.0.0",
+  "name": "@stacksjs/ts-bmp",
+  "version": "0.0.1",
   "description": "A pure TypeScript BMP encoder and decoder with zero dependencies",
   "author": "Chris Breuer <chris@stacksjs.org>",
   "license": "MIT",

@@ -169,6 +169,10 @@ function validateHeaders(
     )
   }
 
+  // Per BMP spec, the planes field is always 1.
+  if (infoHeader.planes !== 1)
+    throw new Error(`Invalid BMP: planes must be 1, got ${infoHeader.planes}`)
+
   // Compression must be appropriate for the bit depth.
   const { bitsPerPixel, compression } = infoHeader
   switch (compression) {
